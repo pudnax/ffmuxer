@@ -1,0 +1,41 @@
+AVCodecContext  -> codec::Context
+AVFormatContext -> format::context::Input
+                   format::context::Output
+                   format::common::Context
+AVCodec         -> codec::Codec
+AVCodecId       -> codec::Id
+AVStream        -> StreamMut
+AVFrame         -> Frame
+SwsContext      -> scaling::Context
+SwrContext      -> resamping::Context
+AVPacket        -> Packet
+                   packet::borrow::Borrow
+                   packet:SideDataIter
+AVOutputFormat  -> device::VideoIter
+                   device::AudioIter
+                   format::Iter
+                   format::output::Output
+AVDictionary    -> dictionary::Iter
+                   dictionary::Ref (mutable/imutable)
+                   Dictionary (as Owned(Ref))
+AVBuffer        -> ???
+
+Encoder                   -> Encoder(codec::Context)
+Context                   -> enum Input + Output
+context::common::Context  -> AVForamtContext
+                             Rc<Desctructor>
+codec::Context            -> AVCodecContext
+                             Rc<dyn Drop>
+format::context::Input    -> AVFormatContext
+                             Context (common)
+format::format::Input     -> AVInputFormat
+format::context::Output   -> AVFormatContext
+                             Context (common)
+format::format::Output    -> AVOutputFormat
+Codec                     -> AvCodec
+Video       -> Codec | Opened | Frame | Super
+    Super   -> Encoder(codec::Context)
+    Frame   -> Frame { AVFrame | _own: bool }
+    Opened  -> Decoder(codec::Context)
+    Codec   -> AVCodec
+Buffer      -> usual rust struct
