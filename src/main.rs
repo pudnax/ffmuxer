@@ -70,7 +70,7 @@ fn alloc_picture(format: format::Pixel, width: u32, height: u32) -> frame::Video
 }
 
 struct VideoStream {
-    encoder: encoder::video::Video,
+    encoder: encoder::Encoder,
     stream_info: (usize, Rational),
 
     frame: frame::Video,
@@ -84,23 +84,74 @@ impl VideoStream {
         output: &mut format::context::Output,
         options: Dictionary,
     ) -> Result<Self, util::error::Error> {
-        let fmt = output.format();
-        let audio_codec_id = unsafe { arrow!(fmt, video_codec) };
+        let format = output.format();
+        let video_codec_id = unsafe { arrow!(format, video_codec) };
 
-        dbg!(audio_codec_id);
-        let codec = codec::encoder::find(audio_codec_id.into()).unwrap();
+        let codec = codec::encoder::find(video_codec_id.into())
+            .unwrap()
+            .video()?;
 
-        let stream = output.add_stream(codec)?;
-        dbg!(stream.time_base());
-        dbg!(stream.index());
+        let mut stream = output.add_stream(codec)?;
 
-        let mut context = codec::Context::new();
+        let context = codec::Context::new();
+        let mut encoder = context.encoder().video()?;
+
         unsafe {
-            arrow_mut!(context, codec_type) = media::Type::Video.into();
+            arrow_mut!(encoder, codec_id) = video_codec_id;
         }
-        dbg!(context.medium());
 
-        todo!();
+        encoder.set_bit_rate(400_000);
+        encoder.set_width(352);
+        encoder.set_height(288);
+
+        stream.set_time_base((1, 60));
+
+        encoder.set_time_base(stream.time_base());
+
+        encoder.set_gop(12);
+        encoder.set_format(STREAM_FORMAT);
+        if video_codec_id == Id::MPEG2VIDEO.into() {
+            encoder.set_max_b_frames(2);
+        }
+        if video_codec_id == Id::MPEG1VIDEO.into() {
+            encoder.set_mb_decision(encoder::Decision::RateDistortion);
+        }
+
+        if format.flags().contains(format::Flags::GLOBAL_HEADER) {
+            unsafe {
+                (*encoder.as_mut_ptr()).flags |= codec::Flags::GLOBAL_HEADER.bits() as i32;
+            }
+        }
+
+        let encoder = encoder.open_as_with(codec, options.clone())?;
+
+        let frame = alloc_picture(encoder.format(), encoder.width(), encoder.height());
+        let tmp_frame = alloc_picture(
+            format::pixel::Pixel::YUV420P,
+            encoder.width(),
+            encoder.height(),
+        );
+
+        let sws_context = software::scaling::Context::get(
+            format::Pixel::YUV420P,
+            encoder.width(),
+            encoder.height(),
+            encoder.format(),
+            encoder.width(),
+            encoder.height(),
+            software::scaling::flag::Flags::BICUBIC,
+        )?;
+
+        stream.set_parameters(codec::Parameters::from(&encoder));
+        let stream_info = (stream.index(), stream.time_base());
+
+        Ok(Self {
+            encoder: encoder.0 .0,
+            frame,
+            tmp_frame,
+            stream_info,
+            sws_context,
+        })
     }
 }
 
@@ -149,12 +200,9 @@ impl AudioStream {
             .unwrap()
             .audio()?;
 
-        let mut stream = output.add_stream(codec).unwrap();
+        let mut stream = output.add_stream(codec)?;
 
-        let mut context = codec::Context::new();
-        unsafe {
-            arrow_mut!(context, codec_type) = media::Type::Audio.into();
-        }
+        let context = codec::Context::new();
         let mut encoder = context.encoder().audio()?;
 
         if let Some(mut sample_format) = codec.formats() {
