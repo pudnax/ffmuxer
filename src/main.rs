@@ -1,29 +1,38 @@
 use codec::Id;
 use ffmpeg::{
-    codec, encoder, format, media, software, sys,
-    util::{self, error, frame, rational::Rational},
-    ChannelLayout, Codec, Dictionary, StreamMut,
+    codec, encoder, format,
+    packet::Mut,
+    software, sys,
+    util::{self, frame, rational::Rational},
+    ChannelLayout, Dictionary,
 };
 use ffmpeg_next as ffmpeg;
-use format::{sample, Flags};
-use std::{any::Any, path::Path, time::Instant};
+use std::{path::Path, time::Instant};
 
+const DEFAULT_X264_OPTS: &str = "";
 // const DEFAULT_X264_OPTS: &str = "preset=medium";
-const DEFAULT_X264_OPTS: &str = "preset=veryslow,crf=18";
+// const DEFAULT_X264_OPTS: &str = "preset=veryslow,crf=18";
 const STREAM_FORMAT: format::Pixel = format::Pixel::YUV420P;
+const STREAM_DURATION: i64 = 10;
 
 #[macro_export]
 macro_rules! arrow {
-    ($base:path, $field:ident) => {
-        (*$base.as_ptr()).$field
-    };
+    ($base:path, $field:ident) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            (*$base.as_ptr()).$field
+        }
+    }};
 }
 
 #[macro_export]
 macro_rules! arrow_mut {
-    ($base:path, $field:ident) => {
-        (*$base.as_mut_ptr()).$field
-    };
+    ($base:path, $field:ident) => {{
+        #[allow(unused_unsafe)]
+        unsafe {
+            (*$base.as_mut_ptr()).$field
+        }
+    }};
 }
 
 fn fill_yuv_image(pict: &mut frame::video::Video, frame_index: i64, width: usize, height: usize) {
@@ -36,14 +45,40 @@ fn fill_yuv_image(pict: &mut frame::video::Video, frame_index: i64, width: usize
         }
     }
 
-    for y in 0..height - 1 {
-        for x in 0..width {
+    for y in 0..height / 2 {
+        for x in 0..width / 2 {
             // dbg!(y * linesize[1] as usize + x);
-            pict.data_mut(1)[y * ((linesize[1] - 1) / 2) as usize + x] =
-                ((128 + y) as i64 + i * 2) as u8;
-            pict.data_mut(2)[y * ((linesize[1] - 1) / 2) as usize + x] =
-                ((64 + x) as i64 + i * 5) as u8;
+            pict.data_mut(1)[y * linesize[1] as usize + x] = ((128 + y) as i64 + i * 2) as u8;
+            pict.data_mut(2)[y * linesize[2] as usize + x] = ((64 + x) as i64 + i * 5) as u8;
         }
+    }
+}
+
+fn write_frame(
+    output: &mut format::context::Output,
+    encoder: &mut codec::encoder::Encoder,
+    (stream_index, st_tb): (usize, Rational),
+    frame: &util::frame::Frame,
+) -> Result<(), util::error::Error> {
+    encoder.send_frame(frame)?;
+    let enc_tb = unsafe { arrow!(encoder, time_base) };
+
+    loop {
+        let mut packet = codec::packet::Packet::empty();
+
+        match encoder.receive_packet(&mut packet) {
+            Ok(_) => {}
+            Err(util::error::Error::Other {
+                errno: util::error::EAGAIN,
+            })
+            | Err(util::error::Error::Eof) => return Ok(()),
+            Err(e) => panic!("Error on video recording with: {}", e),
+        }
+
+        unsafe { sys::av_packet_rescale_ts(packet.as_mut_ptr(), enc_tb, st_tb.into()) };
+        packet.set_stream(stream_index);
+
+        packet.write_interleaved(output)?;
     }
 }
 
@@ -52,7 +87,7 @@ struct VideoParams {
     fps: i32,
     width: u32,
     height: u32,
-    bitrate: usize,
+    bit_rate: usize,
 }
 
 fn alloc_picture(format: format::Pixel, width: u32, height: u32) -> frame::Video {
@@ -83,6 +118,7 @@ impl VideoStream {
     fn open(
         output: &mut format::context::Output,
         options: Dictionary,
+        video_params: &VideoParams,
     ) -> Result<Self, util::error::Error> {
         let format = output.format();
         let video_codec_id = unsafe { arrow!(format, video_codec) };
@@ -97,14 +133,14 @@ impl VideoStream {
         let mut encoder = context.encoder().video()?;
 
         unsafe {
-            arrow_mut!(encoder, codec_id) = video_codec_id;
+            (*encoder.as_mut_ptr()).codec_id = video_codec_id;
         }
 
-        encoder.set_bit_rate(400_000);
-        encoder.set_width(352);
-        encoder.set_height(288);
+        encoder.set_bit_rate(video_params.bit_rate);
+        encoder.set_width(video_params.width);
+        encoder.set_height(video_params.height);
 
-        stream.set_time_base((1, 60));
+        stream.set_time_base((1, video_params.fps));
 
         encoder.set_time_base(stream.time_base());
 
@@ -178,7 +214,9 @@ fn alloc_audio_frame(
 struct AudioStream {
     encoder: encoder::Encoder,
     stream_info: (usize, Rational),
-    samples_count: usize,
+    samples_count: i64,
+
+    t: f32,
     tincr: f32,
     tincr2: f32,
 
@@ -291,6 +329,7 @@ impl AudioStream {
             encoder: encoder.0 .0,
             stream_info,
             samples_count: 0,
+            t: 0.,
             tincr,
             tincr2,
             frame,
@@ -303,7 +342,7 @@ impl AudioStream {
 struct OutputStream<T> {
     encoder: T,
 
-    next_pts: usize,
+    next_pts: i64,
     logging_enabled: bool,
     frame_count: usize,
     last_log_frame_count: usize,
@@ -311,107 +350,153 @@ struct OutputStream<T> {
     last_log_time: Instant,
 }
 
-impl OutputStream<VideoStream> {}
+impl OutputStream<VideoStream> {
+    fn get_frame(&mut self) -> Option<&frame::Video> {
+        let enc = &self.encoder.encoder;
+        let time_base = unsafe { arrow!(enc, time_base) };
+        let width = unsafe { arrow!(enc, width) } as usize;
+        let height = unsafe { arrow!(enc, height) } as usize;
+        if unsafe {
+            sys::av_compare_ts(
+                self.next_pts,
+                time_base,
+                STREAM_DURATION,
+                Rational::from((1, 1)).into(),
+            )
+        } > 0
+        {
+            return None;
+        }
 
-impl OutputStream<AudioStream> {}
+        unsafe { sys::av_frame_make_writable(self.encoder.frame.as_mut_ptr()) }; // FIXME: Handle err
 
-impl<T> OutputStream<T> {
-    fn new(
-        output: &mut format::context::Output,
-        flags: Flags,
-        params: &VideoParams,
-        codec: &Codec,
-        enable_logging: bool,
-    ) -> Result<Self, error::Error> {
-        // let context =
-        //     unsafe { codec::Context::wrap(sys::avcodec_alloc_context3(codec.as_ptr()), None) };
-        // let mut encoder = context.encoder().video()?;
+        fill_yuv_image(&mut self.encoder.tmp_frame, self.next_pts, width, height);
+        self.encoder
+            .sws_context
+            .run(&self.encoder.tmp_frame, &mut self.encoder.frame)
+            .unwrap();
 
-        // let mut stream = output.add_stream(encoder.codec())?;
+        self.next_pts += 1;
+        self.encoder.frame.set_pts(Some(self.next_pts));
 
-        // let id: sys::AVCodecID = codec.id().into();
-        // unsafe { (*encoder.as_mut_ptr()).codec_id = id };
-        // encoder.set_bit_rate(params.bitrate);
-        // encoder.set_width(params.width);
-        // encoder.set_height(params.height);
-        // encoder.set_aspect_ratio((params.height as i32, params.width as i32));
-        // encoder.set_gop(10); // 12
-        // encoder.set_frame_rate(Some((params.fps, 1)));
-        // if encoder.id() == Id::MPEG2VIDEO {
-        //     encoder.set_max_b_frames(2);
-        // }
-        // if encoder.id() == Id::MPEG1VIDEO {
-        //     encoder.set_mb_decision(encoder::Decision::RateDistortion);
-        // }
-        // encoder.set_format(STREAM_FORMAT);
-
-        // stream.set_time_base((1, params.fps));
-        // // stream.set_parameters(&encoder);
-        // unsafe {
-        //     sys::avcodec_parameters_from_context((*stream.as_mut_ptr()).codecpar, encoder.as_ptr())
-        // };
-
-        // encoder.set_time_base(stream.time_base());
-
-        // if flags.contains(format::Flags::GLOBAL_HEADER) {
-        //     unsafe {
-        //         (*encoder.as_mut_ptr()).flags |= codec::Flags::GLOBAL_HEADER.bits() as i32;
-        //     }
-        // }
-
-        // let stream_info = (stream.index(), stream.time_base());
-        // // let encoder = encoder.open_as_with(codec, x264_opts)?;
-        // // let encoder = encoder.video()?;
-        // Ok(Self {
-        //     encoder,
-        //     stream_info,
-        //     logging_enabled: enable_logging,
-        //     frame_count: 0,
-        //     last_log_frame_count: 0,
-        //     starting_time: Instant::now(),
-        //     last_log_time: Instant::now(),
-        // })
-        todo!()
+        Some(&self.encoder.frame)
     }
 
-    // fn encode(
-    //     &mut self,
-    //     frame: &util::frame::Frame,
-    //     (stream_index, stream_timebase): (usize, Rational),
-    //     output: &mut format::context::Output,
-    // ) -> Result<(), util::error::Error> {
-    //     self.encoder.send_frame(frame)?;
-    //     let src_timebase = unsafe { (*self.encoder.as_ptr()).time_base };
+    fn write_frame(
+        &mut self,
+        output: &mut format::context::Output,
+    ) -> Result<(), util::error::Error> {
+        if let Some(ref frame) = self.get_frame() {
+            let frame = unsafe { util::frame::Frame::wrap(frame.as_ptr() as _) };
+            write_frame(
+                output,
+                &mut self.encoder.encoder,
+                self.encoder.stream_info,
+                &frame,
+            )?;
+        }
 
-    //     loop {
-    //         let mut packet = {
-    //             let p_info = frame.packet();
-    //             let mut packet = codec::packet::Packet::empty();
-    //             packet.set_pts(Some(p_info.pts));
-    //             packet.set_dts(Some(p_info.dts));
-    //             packet.set_duration(p_info.duration);
-    //             packet.set_position(p_info.position as isize);
-    //             packet
-    //         };
+        Ok(())
+    }
+}
 
-    //         self.frame_count += 1;
-    //         self.log_progress();
+// use util::mathematics::Rescale;
 
-    //         match self.encoder.receive_packet(&mut packet) {
-    //             Ok(_) => {}
-    //             Err(error::Error::Other {
-    //                 errno: error::EAGAIN,
-    //             })
-    //             | Err(error::Error::Eof) => return Ok(()),
-    //             Err(e) => panic!("Error with: {}", e),
-    //         }
+impl OutputStream<AudioStream> {
+    fn get_frame(&mut self) -> Option<&frame::Audio> {
+        let enc = &self.encoder.encoder;
+        let time_base = unsafe { arrow!(enc, time_base) };
+        let channels = unsafe { arrow!(enc, channels) };
+        let num_samples = self.encoder.tmp_frame.samples();
+        let data = self.encoder.tmp_frame.data_mut(0);
+        if unsafe {
+            sys::av_compare_ts(
+                self.next_pts,
+                time_base,
+                STREAM_DURATION,
+                Rational::from((1, 1)).into(),
+            )
+        } > 0
+        {
+            return None;
+        }
 
-    //         packet.rescale_ts(src_timebase, stream_timebase);
-    //         packet.set_stream(stream_index);
+        let mut index = 0;
+        for _ in 0..num_samples {
+            let v = self.encoder.t.sin() * 10_000.;
+            for _ in 0..channels {
+                data[index] = v as u8;
+                index += 1;
+            }
+            self.encoder.t += self.encoder.tincr;
+            self.encoder.tincr += self.encoder.tincr2;
+        }
 
-    //         packet.write_interleaved(output)?;
-    //     }
-    // }
+        self.next_pts += 1;
+        self.encoder.frame.set_pts(Some(self.next_pts));
+
+        Some(&self.encoder.frame)
+    }
+
+    fn write_frame(
+        &mut self,
+        output: &mut format::context::Output,
+    ) -> Result<(), util::error::Error> {
+        // let enc = &self.encoder.encoder;
+        // let rate = unsafe { arrow!(enc, sample_rate) };
+
+        // let frame = self.get_frame();
+
+        // if let Some(mut f) = frame {
+        //     let delay =
+        //         unsafe { sys::swr_get_delay(self.encoder.swr_context.as_ptr() as _, rate as i64) }
+        //             + f.samples() as i64;
+        //     let dst_num_samples =
+        //         delay.rescale_with(rate as f64, rate as f64, ffmpeg::Rounding::Up);
+
+        //     unsafe { sys::av_frame_make_writable(f.as_mut_ptr()) }; // FIXME: Handle err
+
+        //     self.encoder
+        //         .swr_context
+        //         .run(f, &mut self.encoder.frame)
+        //         .unwrap();
+
+        //     f = &self.encoder.frame;
+        //     let time_base = unsafe { arrow!(enc, time_base) };
+        //     unsafe {
+        //         arrow_mut!(f, pts) = self
+        //             .encoder
+        //             .samples_count
+        //             .rescale((1, rate), Rational::from(time_base));
+        //     };
+
+        //     self.encoder.samples_count += dst_num_samples;
+        // }
+        if let Some(ref frame) = self.get_frame() {
+            let frame = unsafe { util::frame::Frame::wrap(frame.as_ptr() as _) };
+            write_frame(
+                output,
+                &mut self.encoder.encoder,
+                self.encoder.stream_info,
+                &frame,
+            )?
+        }
+        Ok(())
+    }
+}
+
+impl<T> OutputStream<T> {
+    fn new(encoder: T, logging_enabled: bool) -> Self {
+        Self {
+            encoder,
+            next_pts: 0,
+            logging_enabled,
+            frame_count: 0,
+            last_log_frame_count: 0,
+            starting_time: Instant::now(),
+            last_log_time: Instant::now(),
+        }
+    }
 
     fn log_progress(&mut self) {
         if !self.logging_enabled
@@ -454,55 +539,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fps: 60,
         width: 352,
         height: 288,
-        bitrate: 400_000,
+        bit_rate: 400_000,
     };
 
-    AudioStream::open(&mut output, x264_opts.clone());
-    VideoStream::open(&mut output, x264_opts.clone())?;
-    // let mut recorder =
-    //     Recorder::new(&mut output, format.flags(), &video_params, &codec, true).unwrap();
+    let mut audio_stream =
+        OutputStream::new(AudioStream::open(&mut output, x264_opts.clone())?, true);
+    let mut video_stream = OutputStream::new(
+        VideoStream::open(&mut output, x264_opts.clone(), &video_params)?,
+        true,
+    );
 
-    // let mut frame = alloc_picture(
-    //     recorder.encoder.format(),
-    //     recorder.encoder.width(),
-    //     recorder.encoder.height(),
-    // );
-    // // frame.set_metadata(x264_opts);
+    output.write_header()?;
 
-    // format::context::output::dump(&output, 0, filename.to_str());
+    let (mut encode_video, mut encode_audio) = (true, true);
+    while encode_audio || encode_video {
+        if encode_video
+            && (!encode_audio
+                || unsafe {
+                    sys::av_compare_ts(
+                        video_stream.next_pts,
+                        (*video_stream.encoder.encoder.as_ptr()).time_base,
+                        audio_stream.next_pts,
+                        (*audio_stream.encoder.encoder.as_ptr()).time_base,
+                    ) <= 0
+                })
+        {
+            encode_video = video_stream.write_frame(&mut output).is_ok();
+        } else {
+            encode_audio = audio_stream.write_frame(&mut output).is_ok();
+        }
+    }
 
-    // output.write_header().unwrap();
-
-    // for i in 0..175 {
-    //     println!("Frame: {}", i);
-
-    //     fill_yuv_image(
-    //         &mut frame,
-    //         recorder.frame_count as i64,
-    //         recorder.encoder.width() as usize,
-    //         recorder.encoder.height() as usize,
-    //     );
-
-    //     // for y in 0..frame.height() as usize {
-    //     //     for x in 0..frame.width() as usize {
-    //     //         frame.data_mut(0)[y * linesize[0] as usize] = ((128 + 7) as i64 + i * 2) as u8;
-    //     //         frame.data_mut(1)[(y >> 1) * linesize[1] as usize + (x >> 1)] =
-    //     //             ((64 + x) as i64 + i * 5) as u8;
-    //     //         frame.data_mut(2)[(y >> 1) * linesize[2] as usize + (x >> 1)] =
-    //     //             ((64 + x) as i64 + i * 5) as u8;
-    //     //     }
-    //     // }
-
-    //     // frame.set_pts(Some(i as i64));
-
-    //     recorder
-    //         .encode(&frame, recorder.stream_info, &mut output)
-    //         .unwrap();
-    // }
-
-    // output.write_trailer().unwrap();
-
-    // recorder.encoder.send_eof().unwrap();
-
+    output.write_trailer()?;
     Ok(())
 }
