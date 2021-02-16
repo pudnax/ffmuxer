@@ -1,16 +1,30 @@
 use codec::Id;
 use ffmpeg::{
-    codec, encoder, format, software, sys,
+    codec, encoder, format, media, software, sys,
     util::{self, error, frame, rational::Rational},
-    Codec, Dictionary, StreamMut,
+    ChannelLayout, Codec, Dictionary, StreamMut,
 };
 use ffmpeg_next as ffmpeg;
 use format::{sample, Flags};
-use std::{path::Path, time::Instant};
+use std::{any::Any, path::Path, time::Instant};
 
 // const DEFAULT_X264_OPTS: &str = "preset=medium";
 const DEFAULT_X264_OPTS: &str = "preset=veryslow,crf=18";
 const STREAM_FORMAT: format::Pixel = format::Pixel::YUV420P;
+
+#[macro_export]
+macro_rules! arrow {
+    ($base:path, $field:ident) => {
+        (*$base.as_ptr()).$field
+    };
+}
+
+#[macro_export]
+macro_rules! arrow_mut {
+    ($base:path, $field:ident) => {
+        (*$base.as_mut_ptr()).$field
+    };
+}
 
 fn fill_yuv_image(pict: &mut frame::video::Video, frame_index: i64, width: usize, height: usize) {
     let i = frame_index;
@@ -65,6 +79,31 @@ struct VideoStream {
     sws_context: software::scaling::Context,
 }
 
+impl VideoStream {
+    fn open(
+        output: &mut format::context::Output,
+        options: Dictionary,
+    ) -> Result<Self, util::error::Error> {
+        let fmt = output.format();
+        let audio_codec_id = unsafe { arrow!(fmt, video_codec) };
+
+        dbg!(audio_codec_id);
+        let codec = codec::encoder::find(audio_codec_id.into()).unwrap();
+
+        let stream = output.add_stream(codec)?;
+        dbg!(stream.time_base());
+        dbg!(stream.index());
+
+        let mut context = codec::Context::new();
+        unsafe {
+            arrow_mut!(context, codec_type) = media::Type::Video.into();
+        }
+        dbg!(context.medium());
+
+        todo!();
+    }
+}
+
 fn alloc_audio_frame(
     sample_format: format::Sample,
     channel_layout: util::channel_layout::ChannelLayout,
@@ -86,7 +125,7 @@ fn alloc_audio_frame(
 }
 
 struct AudioStream {
-    encoder: encoder::audio::Audio,
+    encoder: encoder::Encoder,
     stream_info: (usize, Rational),
     samples_count: usize,
     tincr: f32,
@@ -100,81 +139,117 @@ struct AudioStream {
 
 impl AudioStream {
     fn open(
-        stream: &mut StreamMut,
-        mut encoder: encoder::audio::Audio,
-        format_ctx: format::context::Output,
-        codec: &Codec,
+        output: &mut format::context::Output,
         options: Dictionary,
     ) -> Result<Self, util::error::Error> {
+        let format = output.format();
+        let audio_codec_id = unsafe { arrow!(format, audio_codec) };
+
+        let codec = codec::encoder::find(audio_codec_id.into())
+            .unwrap()
+            .audio()?;
+
+        let mut stream = output.add_stream(codec).unwrap();
+
+        let mut context = codec::Context::new();
         unsafe {
-            let mut opts = options.clone().disown();
-            let res = sys::avcodec_open2(encoder.as_mut_ptr(), codec.as_ptr(), &mut opts);
-            Dictionary::own(opts);
-            match res {
-                0 => {}
-                e => return Err(util::error::Error::from(e)),
+            arrow_mut!(context, codec_type) = media::Type::Audio.into();
+        }
+        let mut encoder = context.encoder().audio()?;
+
+        if let Some(mut sample_format) = codec.formats() {
+            encoder.set_format(sample_format.next().unwrap());
+        } else {
+            encoder.set_format(format::Sample::F32(format::sample::Type::Planar));
+        }
+        encoder.set_bit_rate(64000);
+        encoder.set_rate(if let Some(mut sample_rates) = codec.rates() {
+            let mut rate = sample_rates.next().unwrap();
+            for rates in sample_rates {
+                if 44100 == rates {
+                    rate = 44100
+                }
+            }
+            rate
+        } else {
+            44100
+        });
+
+        let channel_layout = if let Some(mut channel_layouts) = codec.channel_layouts() {
+            let mut res = channel_layouts.next().unwrap();
+            for layout in channel_layouts {
+                dbg!(&layout);
+                if layout == ChannelLayout::STEREO {
+                    res = ChannelLayout::STEREO;
+                }
+            }
+            res
+        } else {
+            ChannelLayout::STEREO
+        };
+        encoder.set_channel_layout(channel_layout);
+        encoder.set_channels(channel_layout.channels());
+
+        stream.set_time_base((1, encoder.rate() as i32));
+
+        if format.flags().contains(format::Flags::GLOBAL_HEADER) {
+            unsafe {
+                (*encoder.as_mut_ptr()).flags |= codec::Flags::GLOBAL_HEADER.bits() as i32;
             }
         }
 
-        // let enc = encoder.encoder().audio()?;
+        let encoder = encoder.open_as_with(codec, options.clone())?;
 
-        let sample_rate = encoder.rate() as f32;
-        let tincr = 2. * std::f32::consts::PI * 110. / sample_rate;
-        let tincr2 = 2. * std::f32::consts::PI * 110. / sample_rate / sample_rate;
+        let tincr = 2. * std::f32::consts::PI / encoder.rate() as f32;
+        let tincr2 = 2. * std::f32::consts::PI / encoder.rate() as f32 / encoder.rate() as f32;
 
-        let samples_count = if codec
+        let nb_samples = if codec
             .capabilities()
-            .contains(codec::capabilities::Capabilities::VARIABLE_FRAME_SIZE)
+            .contains(codec::Capabilities::VARIABLE_FRAME_SIZE)
         {
             10_000
         } else {
-            unsafe { (*encoder.as_ptr()).frame_size }
-        } as usize;
+            encoder.frame_size() as usize
+        };
 
         let frame = alloc_audio_frame(
             encoder.format(),
             encoder.channel_layout(),
             encoder.rate(),
-            samples_count,
+            nb_samples,
         );
         let tmp_frame = alloc_audio_frame(
             format::Sample::I16(format::sample::Type::Packed),
             encoder.channel_layout(),
             encoder.rate(),
-            samples_count,
+            nb_samples,
         );
 
-        unsafe {
-            sys::avcodec_parameters_from_context((*stream.as_mut_ptr()).codecpar, encoder.as_ptr())
-        };
-        let stream_info = (stream.index(), stream.time_base());
+        stream.set_parameters(codec::Parameters::from(&encoder));
 
-        let swr_context = software::resampling::Context::get_with(
+        let swr_context = software::resampling::context::Context::get_with(
             format::Sample::I16(format::sample::Type::Packed),
             encoder.channel_layout(),
             encoder.rate(),
             encoder.format(),
             encoder.channel_layout(),
             encoder.rate(),
-            options,
+            options.clone(),
         )?;
 
+        let stream_info = (stream.index(), stream.time_base());
+
         Ok(Self {
-            swr_context,
-            encoder,
-            frame,
-            tmp_frame,
+            encoder: encoder.0 .0,
+            stream_info,
+            samples_count: 0,
             tincr,
             tincr2,
-            stream_info,
-            samples_count,
+            frame,
+            tmp_frame,
+            swr_context,
         })
     }
-}
-
-enum EncoderType {
-    Video(VideoStream),
-    Audio(AudioStream),
 }
 
 struct OutputStream<T> {
@@ -326,11 +401,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let x264_opts = parse_opts(DEFAULT_X264_OPTS.to_string()).unwrap();
 
     let mut output = format::output_with(&filename, x264_opts.clone()).unwrap();
-    let format = output.format();
-    let codec = {
-        let id: Id = unsafe { (*format.as_ptr()).video_codec }.into();
-        encoder::find(id).unwrap()
-    };
 
     let video_params = VideoParams {
         fps: 60,
@@ -338,6 +408,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: 288,
         bitrate: 400_000,
     };
+
+    AudioStream::open(&mut output, x264_opts.clone());
+    VideoStream::open(&mut output, x264_opts.clone())?;
     // let mut recorder =
     //     Recorder::new(&mut output, format.flags(), &video_params, &codec, true).unwrap();
 
