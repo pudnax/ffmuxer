@@ -1,0 +1,11 @@
+[package]
+name = "fftotal_unsafe"
+version = "0.1.0"
+authors = ["Alex Komissarov <k.a.komissar@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ffmpeg-next = "4.3.1"
+ffmpeg-sys-next = "4.3.1"
